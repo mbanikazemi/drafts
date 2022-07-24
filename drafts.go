@@ -19,12 +19,27 @@ import (
 	bpf "github.com/aquasecurity/libbpfgo"
 )
 
+// Each eBPF program in drafts.bpf.c (search for "eBPF program types") is
+// described as one event to userland code. Each event can be enabled/disabled.
+// If enabled, the eBPF program will generate an event to userland and the event
+// will be displayed.
+//
+// For you: pick the event most similar to what you need and duplicate it in
+// drafts.bpf.c. Make sure to rename the eBPF program name (the function name)
+// and extend the event types with the type you just created. You can disable
+// all other events and only enable the one you're creating. You can also
+// extend the "data" struct to submit more data from eBPF to userland (make
+// sure to check struct padding if you do so).
+
+// existing eBPF events
+
 type EventType uint32
 
 const (
 	EventKprobeSync EventType = iota + 1
 	EventKprobeSyncMap
 	EventTpSync
+	EventCgroupSocket
 )
 
 func NewEventType(eventNum uint32) EventType {
@@ -32,6 +47,7 @@ func NewEventType(eventNum uint32) EventType {
 		1: EventKprobeSync,
 		2: EventKprobeSyncMap,
 		3: EventTpSync,
+		4: EventCgroupSocket,
 	}
 
 	return m[eventNum]
@@ -48,11 +64,12 @@ func (e EventType) String() string {
 }
 
 //
-// data structure sent from kernel to userland
+// data structure sent from kernel to userland (add more types as needed)
 //
 
 // data the way eBPF programs see
 type data struct {
+	// task_info struct
 	StartTime uint64   // 08 bytes: 000-063 : task start time
 	Pid       uint32   // 04 bytes: 064-095 : host process id
 	Tgid      uint32   // 04 bytes: 096-127: host thread group id
@@ -61,12 +78,13 @@ type data struct {
 	Gid       uint32   // 04 bytes: 192-223: group id
 	Comm      [16]byte // 16 bytes: 224-351: command (task_comm_len)
 	Padding   uint32   // 04 bytes: 352-383: padding/empty
-	Origin    uint32   // 04 bytes: 384-387: eBPF program that generated event
+	// end of task_info struct
+	EventType uint32 // 04 bytes: 384-387: eBPF program that generated event
 }
 
 // data the way userland golang program sees
 type goData struct {
-	Origin    EventType
+	EventType EventType
 	StartTime uint
 	Pid       uint
 	Tgid      uint
@@ -75,6 +93,8 @@ type goData struct {
 	Gid       uint
 	Comm      string
 }
+
+// =D
 
 func main() {
 	// create an eBPF module using eBPF object file from filesystem
@@ -109,11 +129,33 @@ func main() {
 		Error(err)
 	}
 
+	// enable/disable events
+
+	AllEvents := map[EventType]bool{
+		EventKprobeSync: true,
+		// EventKprobeSyncMap is enabled or disabled by EventKprobeSync
+		EventTpSync:       true,
+		EventCgroupSocket: false,
+	}
+
+	bpfMapEnabled, err := bpfModule.GetMap("enabled")
+	if err != nil {
+		Error(err)
+	}
+
+	for k, v := range AllEvents {
+		if v {
+			key := uint32(k)
+			value := uint8(1)
+			bpfMapEnabled.Update(unsafe.Pointer(&key), unsafe.Pointer(&value))
+		}
+	}
+
 	//
 	// EXAMPLES: eBPF program types
 	//
 
-	// KPROBE:
+	// BPF_PROG_TYPE_KPROBE:
 	// SYSCALL_DEFINE0(sync) at sync.c
 
 	bpfProgKprobeSync, err := bpfModule.GetProgram("ksys_sync")
@@ -132,7 +174,7 @@ func main() {
 		Error(err)
 	}
 
-	// TRACEPOINT:
+	// BPF_PROG_TYPE_TRACEPOINT
 	// sys_enter_sync (/sys/kernel/debug/tracing/events/syscalls/sys_enter_sync)
 
 	bpfProgTpSync, err := bpfModule.GetProgram("tracepoint__sys_enter_sync")
@@ -147,6 +189,19 @@ func main() {
 	if err != nil {
 		Error(err)
 	}
+
+	// // BPF_PROG_TYPE_CGROUP_SOCK (https://github.com/aquasecurity/libbpfgo/pull/196)
+	// // cgroupv2 directory (/sys/fs/cgroup/unified for root cgroup directory)
+
+	// bpfProgSocket, err := bpfModule.GetProgram("cgroup__socket_create")
+	// if err != nil {
+	// 	Error(err)
+	// }
+
+	// bpfLinkSocket, err := bpfProgSocket.AttachCgroup("/sys/fs/cgroup/unified")
+	// if err != nil {
+	// 	Error(err)
+	// }
 
 	//
 	// END OF EXAMPLES
@@ -188,7 +243,7 @@ LOOP:
 			// event as a trigger and pick data from the hashmap as well (data
 			// is indexed by pid)
 
-			switch data.Origin { // check for specific eBPF event received
+			switch data.EventType { // check for specific eBPF event received
 			case EventKprobeSync: // if event is "sync" (kprobe)
 
 				// pick bytes from the eBPF hashmap
@@ -201,7 +256,7 @@ LOOP:
 				}
 
 				dataFromMap := parseEvent(dataRawFromMap)
-				dataFromMap.Origin = EventKprobeSyncMap // change event origin
+				dataFromMap.EventType = EventKprobeSyncMap // change type
 				printEvent(dataFromMap)
 			}
 
@@ -226,6 +281,10 @@ LOOP:
 	if err != nil {
 		Error(err)
 	}
+	// err = bpfLinkSocket.Destroy()
+	// if err != nil {
+	// 	Error(err)
+	// }
 
 	os.Exit(0)
 }
@@ -249,7 +308,7 @@ func parseEvent(raw []byte) goData {
 		Uid:       uint(dt.Uid),
 		Gid:       uint(dt.Gid),
 		Comm:      string(bytes.TrimRight(dt.Comm[:], "\x00")),
-		Origin:    NewEventType(dt.Origin),
+		EventType: NewEventType(dt.EventType),
 	}
 
 	return goData
@@ -257,8 +316,8 @@ func parseEvent(raw []byte) goData {
 
 func printEvent(goData goData) {
 	fmt.Printf(
-		"(origin: %s) %s (pid: %d, tgid: %d, ppid: %d, uid: %d, gid: %d)\n",
-		goData.Origin,
+		"(%s) %s (pid: %d, tgid: %d, ppid: %d, uid: %d, gid: %d)\n",
+		goData.EventType,
 		goData.Comm,
 		goData.Pid,
 		goData.Tgid,

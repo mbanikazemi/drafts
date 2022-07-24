@@ -16,7 +16,36 @@ char LICENSE[] SEC("license") = "GPL";
 // EXAMPLES: eBPF map types
 //
 
-// PERF_EVENT_ARRAY (used by perfbuffer)
+// TODO:
+// BPF_MAP_TYPE_ARRAY
+// BPF_MAP_TYPE_PROG_ARRAY
+// BPF_MAP_TYPE_PERCPU_HASH
+// BPF_MAP_TYPE_PERCPU_ARRAY
+// BPF_MAP_TYPE_STACK_TRACE
+// BPF_MAP_TYPE_CGROUP_ARRAY
+// BPF_MAP_TYPE_LRU_HASH
+// BPF_MAP_TYPE_LRU_PERCPU_HASH
+// BPF_MAP_TYPE_LPM_TRIE
+// BPF_MAP_TYPE_ARRAY_OF_MAPS
+// BPF_MAP_TYPE_HASH_OF_MAPS
+// BPF_MAP_TYPE_DEVMAP
+// BPF_MAP_TYPE_SOCKMAP
+// BPF_MAP_TYPE_CPUMAP
+// BPF_MAP_TYPE_XSKMAP
+// BPF_MAP_TYPE_SOCKHASH
+// BPF_MAP_TYPE_CGROUP_STORAGE
+// BPF_MAP_TYPE_REUSEPORT_SOCKARRAY
+// BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE
+// BPF_MAP_TYPE_QUEUE
+// BPF_MAP_TYPE_STACK
+// BPF_MAP_TYPE_SK_STORAGE
+// BPF_MAP_TYPE_DEVMAP_HASH
+// BPF_MAP_TYPE_STRUCT_OPS
+// BPF_MAP_TYPE_RINGBUF
+// BPF_MAP_TYPE_INODE_STORAGE
+// BPF_MAP_TYPE_TASK_STORAGE
+
+// BPF_MAP_TYPE_PERF_EVENT_ARRAY (used by perfbuffer)
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
@@ -25,7 +54,7 @@ struct {
     __uint(value_size, sizeof(u32));
 } perfbuffer SEC(".maps");
 
-// HASHMAP (key/value hash map shared with userland)
+// BPF_MAP_TYPE_HASH (key/value hash map shared with userland)
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -37,14 +66,26 @@ struct {
 // END OF EXAMPLES
 
 //
+// internal maps
+//
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, HASHMAP_MAX_ENTRIES);
+	__type(key, u32); // key = event_type
+	__type(value, u8); // value = 0|1
+} enabled SEC(".maps");
+
+//
 // internal structures
 //
 
-enum origin
+enum event_type
 {
     EVENT_KPROBE_SYNC = 1,
     EVENT_KPROBE_SYNC_MAP,
-    EVENT_TP_SYNC
+    EVENT_TP_SYNC,
+    EVENT_CGROUP_SOCKET
 };
 
 typedef struct task_info {
@@ -61,7 +102,7 @@ typedef struct task_info {
 // main perfbuffer event structure (sent to userland)
 struct event_data {
     struct task_info task;
-    u32 origin;                 // eBPF program event generator
+    u32 event_type;             // eBPF program event generator
 } event_data_t;
 
 //
@@ -126,6 +167,17 @@ get_ppid(struct task_struct *child)
 // internal functions
 //
 
+// check if the event type is enabled or not
+static __always_inline u32
+event_enabled(u32 type)
+{
+    u8 *value = bpf_map_lookup_elem(&enabled, &type);
+    if (!value)
+        return 0;
+
+    return 1;
+}
+
 // return an internal structured called task_info with current task information
 static __always_inline void
 get_task_info(struct task_info *info)
@@ -146,7 +198,7 @@ get_task_info(struct task_info *info)
 static __always_inline void
 get_event_data(u32 orig, struct task_info *info, struct event_data *data)
 {
-    data->origin = orig;
+    data->event_type = orig;
 
     data->task.tgid = info->tgid;
     data->task.pid = info->pid;
@@ -161,12 +213,45 @@ get_event_data(u32 orig, struct task_info *info, struct event_data *data)
 // EXAMPLES: eBPF program types (each function is a different eBPF program)
 //
 
-// KPROBE:
+// TODO:
+// BPF_PROG_TYPE_SOCKET_FILTER,
+// BPF_PROG_TYPE_SCHED_CLS,
+// BPF_PROG_TYPE_SCHED_ACT,
+// BPF_PROG_TYPE_XDP,
+// BPF_PROG_TYPE_PERF_EVENT,
+// BPF_PROG_TYPE_CGROUP_SKB,
+// BPF_PROG_TYPE_LWT_IN,
+// BPF_PROG_TYPE_LWT_OUT,
+// BPF_PROG_TYPE_LWT_XMIT,
+// BPF_PROG_TYPE_SOCK_OPS,
+// BPF_PROG_TYPE_SK_SKB,
+// BPF_PROG_TYPE_CGROUP_DEVICE,
+// BPF_PROG_TYPE_SK_MSG,
+// BPF_PROG_TYPE_RAW_TRACEPOINT,
+// BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+// BPF_PROG_TYPE_LWT_SEG6LOCAL,
+// BPF_PROG_TYPE_LIRC_MODE2,
+// BPF_PROG_TYPE_SK_REUSEPORT,
+// BPF_PROG_TYPE_FLOW_DISSECTOR,
+// BPF_PROG_TYPE_CGROUP_SYSCTL,
+// BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
+// BPF_PROG_TYPE_CGROUP_SOCKOPT,
+// BPF_PROG_TYPE_TRACING,
+// BPF_PROG_TYPE_STRUCT_OPS,
+// BPF_PROG_TYPE_EXT,
+// BPF_PROG_TYPE_LSM,
+// BPF_PROG_TYPE_SK_LOOKUP,
+// BPF_PROG_TYPE_SYSCALL
+
+// BPF_PROG_TYPE_KPROBE:
 // SYSCALL_DEFINE0(sync) at sync.c
 
 SEC("kprobe/ksys_sync")
 int BPF_KPROBE(ksys_sync)
 {
+    if (!event_enabled(EVENT_KPROBE_SYNC))
+        return 0;
+
     struct task_info info = {};
     struct event_data data = {};
 
@@ -190,12 +275,15 @@ int BPF_KPROBE(ksys_sync)
     return 0;
 }
 
-// TRACEPOINT:
+// BPF_PROG_TYPE_TRACEPOINT
 // sys_enter_sync (/sys/kernel/debug/tracing/events/syscalls/sys_enter_sync)
 
 SEC("tracepoint/syscalls/sys_enter_sync")
 int tracepoint__sys_enter_sync(struct trace_event_raw_sys_enter *ctx)
 {
+    if (!event_enabled(EVENT_TP_SYNC))
+        return 0;
+
     struct task_info info = {};
     struct event_data data = {};
 
@@ -213,5 +301,36 @@ int tracepoint__sys_enter_sync(struct trace_event_raw_sys_enter *ctx)
 
     return 0;
 }
+
+// BPF_PROG_TYPE_CGROUP_SOCK (https://github.com/aquasecurity/libbpfgo/pull/196)
+// cgroupv2 directory (/sys/fs/cgroup/unified for root cgroup directory)
+
+// SEC("cgroup/sock_create")
+// int cgroup__socket_create(struct bpf_sock *sk)
+// {
+//     if (!event_enabled(EVENT_CGROUP_SOCKET))
+//         return 0;
+// 
+//     char fmt[] = "socket: family %d type %d protocol %d";
+// 	char fmt2[] = "socket: uid %u gid %u";
+// 
+//     struct task_info info = {};
+//     struct event_data data = {};
+// 
+//     get_task_info(&info);
+//     get_event_data(EVENT_CGROUP_SOCKET, &info, &data);
+// 
+// 	bpf_trace_printk(fmt, sizeof(fmt), sk->family, sk->type, sk->protocol);
+// 	bpf_trace_printk(fmt2, sizeof(fmt2), info.uid, info.gid);
+// 
+//  // block sockets returning 0:
+//  //
+// 	// if (sk->family == PF_INET6 &&
+// 	//     sk->type == SOCK_RAW   &&
+// 	//     sk->protocol == IPPROTO_ICMPV6)
+// 	// 	return 0;
+// 
+// 	return 1; // allow socket to continue
+// }
 
 // END OF EXAMPLES
